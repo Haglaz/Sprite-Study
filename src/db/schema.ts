@@ -1,7 +1,7 @@
 import type { ItemCategory } from '../types/studio';
 
 export const ATELIER_DB_NAME = 'atelier_sprite_v2';
-export const ATELIER_DB_VERSION = 1;
+export const ATELIER_DB_VERSION = 2;
 
 export const STORE_NAMES = [
   'datasets',
@@ -16,6 +16,7 @@ export const STORE_NAMES = [
   'generatedSprites',
   'checkpoints',
   'onnxModels',
+  'promptHistory',
 ] as const;
 
 export type AtelierStoreName = (typeof STORE_NAMES)[number];

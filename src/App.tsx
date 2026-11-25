@@ -46,6 +46,7 @@ import {
 import { listEvolutionCheckpoints } from './evolution/store';
 import type { CoevolutionChampion } from './evolution/types';
 import { runSpriteIndexingJob } from './generation/indexer';
+import { loadPromptHistory, savePromptVersionVerified } from './generation/promptStore';
 import {
   deleteGeneratedSprite,
   loadApprovals,
@@ -57,6 +58,7 @@ import {
 import type {
   ApprovalLabelRecord,
   GeneratedSpriteRecord,
+  PromptHistoryRecord,
   SpriteIndexState,
 } from './generation/types';
 import { mineLessonsFromCalibration } from './lessons/miner';
@@ -140,6 +142,7 @@ export default function App() {
   const [indexProgress, setIndexProgress] = useState<{ done: number; total: number } | null>(null);
   const [generatedSprites, setGeneratedSprites] = useState<GeneratedSpriteRecord[]>([]);
   const [approvals, setApprovals] = useState<ApprovalLabelRecord[]>([]);
+  const [promptHistory, setPromptHistory] = useState<PromptHistoryRecord[]>([]);
   const [championsByCategory, setChampionsByCategory] = useState<
     Partial<Record<ItemCategory, CoevolutionChampion>>
   >({});
@@ -216,15 +219,22 @@ export default function App() {
         }
         setActiveSplit(split);
 
-        // Load persisted generated sprites, human approvals, promoted champions, and Phase 7 T3 state
-        const [savedSprites, savedApprovals, savedCheckpoints, savedVocab, savedT3Model] =
-          await Promise.all([
-            loadGeneratedSprites(defaultDbBackend, datasetKey),
-            loadApprovals(defaultDbBackend, datasetKey),
-            listEvolutionCheckpoints(defaultDbBackend, datasetKey),
-            loadT3Vocabulary(defaultDbBackend, datasetKey),
-            loadT3ModelPackage(defaultDbBackend, datasetKey),
-          ]);
+        // Load persisted generated sprites, human approvals, prompt history, promoted champions, and Phase 7 T3 state
+        const [
+          savedSprites,
+          savedApprovals,
+          savedPromptHistory,
+          savedCheckpoints,
+          savedVocab,
+          savedT3Model,
+        ] = await Promise.all([
+          loadGeneratedSprites(defaultDbBackend, datasetKey),
+          loadApprovals(defaultDbBackend, datasetKey),
+          loadPromptHistory(defaultDbBackend, datasetKey),
+          listEvolutionCheckpoints(defaultDbBackend, datasetKey),
+          loadT3Vocabulary(defaultDbBackend, datasetKey),
+          loadT3ModelPackage(defaultDbBackend, datasetKey),
+        ]);
 
         const champMap: Partial<Record<ItemCategory, CoevolutionChampion>> = {};
         for (const cp of savedCheckpoints) {
@@ -287,6 +297,7 @@ export default function App() {
         setDiagnosticReport(nextDiagnostics);
         setGeneratedSprites(savedSprites);
         setApprovals(savedApprovals);
+        setPromptHistory(savedPromptHistory);
         setChampionsByCategory(champMap);
         setAgents(hydratedAgents);
         setT3Vocabulary(activeVocab);
@@ -501,6 +512,7 @@ export default function App() {
     setSpriteIndex(null);
     setGeneratedSprites([]);
     setApprovals([]);
+    setPromptHistory([]);
     setChampionsByCategory({});
     setAgents([]);
     setRetrainTelemetry(null);
@@ -543,6 +555,7 @@ export default function App() {
         setSpriteIndex(null);
         setGeneratedSprites([]);
         setApprovals([]);
+        setPromptHistory([]);
         setChampionsByCategory({});
         setAgents([]);
         setRetrainTelemetry(null);
@@ -773,6 +786,16 @@ export default function App() {
       setIndexProgress(null);
     }
   }, [dataset, activeSplit, calibration]);
+
+  const handleSavePromptVersion = useCallback(
+    async (record: PromptHistoryRecord): Promise<PromptHistoryRecord> => {
+      const saved = await savePromptVersionVerified(defaultDbBackend, record);
+      const reloaded = await loadPromptHistory(defaultDbBackend, saved.datasetKey);
+      setPromptHistory(reloaded);
+      return saved;
+    },
+    [],
+  );
 
   const handleSaveGeneratedBatch = useCallback(
     async (records: GeneratedSpriteRecord[]) => {
@@ -1178,13 +1201,16 @@ export default function App() {
             championsByCategory={championsByCategory}
             generatedSprites={generatedSprites}
             approvals={approvals}
+            promptHistory={promptHistory}
             t3Vocabulary={t3Vocabulary}
             t3ModelPackage={t3ModelPackage}
             onGoToUpload={() => setActiveModule('upload')}
             onRunIndexing={handleRunIndexing}
+            onSavePromptVersion={handleSavePromptVersion}
             onSaveGeneratedBatch={handleSaveGeneratedBatch}
             onRecordApproval={handleRecordApproval}
             onDeleteGenerated={handleDeleteGenerated}
+            onCreateLessonFromComment={handleCreateLessonFromComment}
             onUpdateT3VocabRole={handleUpdateT3VocabRole}
             onRebuildT3Vocab={handleRebuildT3Vocab}
             onImportT3ModelPackage={handleImportT3ModelPackage}

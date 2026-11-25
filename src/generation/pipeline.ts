@@ -12,9 +12,11 @@ import {
   opTrimOutlineDoubles,
 } from '../evolution/pixelOps';
 import type { CoevolutionChampion } from '../evolution/types';
+import { encodeRgbaToPngBytes } from '../export/trainingDatasetExport';
 import { retrieveLessonsForQuery } from '../lessons/retrieval';
 import type { LessonRecord } from '../lessons/types';
 import type { ItemCategory } from '../types/studio';
+import { SPRITE_SIZE } from '../utils/tibiaParser';
 import {
   buildDeterministicDiffEdits,
   executeBoundedPixelDiff,
@@ -27,13 +29,24 @@ import {
   findNearestRealSprite,
   retrieveDonorsForPrompt,
 } from './indexer';
+import {
+  calcRgbLuma,
+  hexToRgb,
+  upscaleRgbaNearest,
+  validateEngineeredPromptJson,
+} from './promptEngineer';
+import { tibiaifySprite } from './tibiaify';
 import type {
   ApprovalLabelRecord,
+  EngineeredPromptSpec,
   GeneratedSpriteRecord,
   GenerationProvenanceSource,
   GenerationTier,
+  HumannessGateInfo,
+  IndexedSpriteEntry,
   PixelDiffEdit,
   SpriteIndexState,
+  StyleDossier,
 } from './types';
 
 export interface BenchmarkPromptSpec {
@@ -185,8 +198,17 @@ async function requestGeminiSpritePlan(params: {
   maxDiffPixels: number;
   donorTags: string[];
   lessonDirectives: string[];
+  temperature?: number;
 }): Promise<GeminiPlanResponse> {
-  const { prompt, category, tier, maxDiffPixels, donorTags, lessonDirectives } = params;
+  const {
+    prompt,
+    category,
+    tier,
+    maxDiffPixels,
+    donorTags,
+    lessonDirectives,
+    temperature = 0.45,
+  } = params;
 
   const systemInstruction = [
     'You are a Classic Tibia 7.72 32x32 pixel-art palette & pixel-diff planner.',
@@ -215,7 +237,7 @@ async function requestGeminiSpritePlan(params: {
       prompt: userPrompt,
       systemInstruction,
       responseMimeType: 'application/json',
-      temperature: 0.45,
+      temperature,
     }),
   });
 
@@ -362,6 +384,7 @@ export interface GenerateCandidatesOptions {
   category: ItemCategory;
   tier: GenerationTier;
   useGemini: boolean;
+  temperature?: number;
   maxDiffPixels?: number;
   enableRepair?: boolean;
   candidateCount?: number;
@@ -400,6 +423,7 @@ export async function generateSpriteCandidates(
     category,
     tier,
     useGemini,
+    temperature = 0.45,
     maxDiffPixels = 28,
     enableRepair = true,
     candidateCount = 6,
@@ -450,6 +474,7 @@ export async function generateSpriteCandidates(
         maxDiffPixels,
         donorTags,
         lessonDirectives: applicableLessons.map((r) => `${r.lesson.title}: ${r.lesson.directive}`),
+        temperature,
       });
       provenanceSource = tier === 'T1' ? 'gemini-t1' : 'gemini-t2';
     } catch (err) {
@@ -632,3 +657,674 @@ export async function generateSpriteCandidates(
     appliedLessonIds,
   };
 }
+
+// ============================================================================
+// TWO-STEP HUMAN-GATED FLOW: STEP 1 (ENGINEER PROMPT) & STEP 2 (HYBRID GENERATE)
+// ============================================================================
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = '';
+  const chunk = 0x4000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    const slice = bytes.subarray(i, Math.min(i + chunk, bytes.length));
+    bin += String.fromCharCode(...slice);
+  }
+  return btoa(bin);
+}
+
+/**
+ * Encodes up to `maxCount` donor sprites as 64x64 (2x nearest-neighbor) PNG data URLs
+ * for multimodal few-shot conditioning of `/api/gemini/engineer-prompt` and `/api/gemini/generate`.
+ */
+export function encodeDonorSpritesAsPngDataUrls(
+  donors: readonly IndexedSpriteEntry[],
+  maxCount = 8,
+): string[] {
+  const out: string[] = [];
+  for (const donor of donors.slice(0, Math.min(10, maxCount))) {
+    const up = upscaleRgbaNearest(donor.rgba, SPRITE_SIZE, SPRITE_SIZE, 2);
+    const png = encodeRgbaToPngBytes(up.rgba, up.width, up.height);
+    out.push(`data:image/png;base64,${bytesToBase64(png)}`);
+  }
+  return out;
+}
+
+/**
+ * STEP 1 CLIENT — Calls `POST /api/gemini/engineer-prompt` with user's short idea + train-only
+ * style dossier + upscaled donor PNGs (+ optional previousPrompt + adjustmentComment for revisions).
+ * Strictly validates JSON output; throws on malformed JSON or 503 (NEVER silently falls back).
+ */
+export async function requestEngineeredPromptFromServer(params: {
+  idea: string;
+  categoryHint?: ItemCategory;
+  dossier: StyleDossier;
+  donorEntries: readonly IndexedSpriteEntry[];
+  trainPaletteRgb: ReadonlyArray<[number, number, number]>;
+  previousPrompt?: EngineeredPromptSpec | null;
+  adjustmentComment?: string | null;
+  temperature?: number;
+}): Promise<{
+  prompt: EngineeredPromptSpec;
+  model: string;
+}> {
+  const {
+    idea,
+    categoryHint,
+    dossier,
+    donorEntries,
+    trainPaletteRgb,
+    previousPrompt = null,
+    adjustmentComment = null,
+    temperature = 0.4,
+  } = params;
+
+  const images = encodeDonorSpritesAsPngDataUrls(donorEntries, 8);
+  const resp = await fetch('/api/gemini/engineer-prompt', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      idea: idea.trim(),
+      categoryHint,
+      styleDossier: dossier,
+      images,
+      previousPrompt,
+      adjustmentComment: adjustmentComment?.trim() || undefined,
+      temperature,
+    }),
+  });
+
+  const payload = (await resp.json().catch(() => ({}))) as {
+    prompt?: unknown;
+    model?: string;
+    error?: string;
+    aiReady?: boolean;
+  };
+
+  if (!resp.ok) {
+    throw new Error(
+      payload.error || `Engenheiro de Prompt falhou com HTTP ${resp.status}.`,
+    );
+  }
+
+  const validDonorIds = new Set(dossier.allowedDonorIds);
+  const validated = validateEngineeredPromptJson(payload.prompt, {
+    validDonorIds,
+    datasetPaletteRgb: trainPaletteRgb,
+  });
+
+  return {
+    prompt: validated,
+    model: payload.model || 'gemini',
+  };
+}
+
+/**
+ * Decodes a structured 32x32 indexed grid JSON returned by Gemini:
+ * `{"palette": ["#121826", ...], "rows": ["....111...", ... 32 rows of 32 chars]}`
+ * where `.` or `0` = transparent, `1..9` and `A..Z`/`a..z` map to 1-based palette indices.
+ */
+export function decodeStructuredIndexedGridJson(raw: string): Uint8ClampedArray | null {
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+
+  if (!Array.isArray(parsed.palette) || !Array.isArray(parsed.rows)) return null;
+  if (parsed.rows.length !== SPRITE_SIZE) return null;
+
+  const paletteRgb: Array<[number, number, number]> = [];
+  for (const hex of parsed.palette) {
+    if (typeof hex !== 'string') return null;
+    const rgb = hexToRgb(hex);
+    if (!rgb) return null;
+    paletteRgb.push(rgb);
+  }
+  if (paletteRgb.length < 3) return null;
+
+  const symbols = '123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+  const rgba = new Uint8ClampedArray(SPRITE_SIZE * SPRITE_SIZE * 4);
+  const rawRows: unknown[] = parsed.rows;
+  let opaque = 0;
+
+  for (let y = 0; y < SPRITE_SIZE; y++) {
+    const row: unknown = rawRows[y];
+    if (typeof row !== 'string' || row.length !== SPRITE_SIZE) return null;
+    for (let x = 0; x < SPRITE_SIZE; x++) {
+      const ch = row[x];
+      if (ch === '.' || ch === '0' || ch === ' ') continue;
+      const idx = symbols.indexOf(ch);
+      if (idx < 0 || idx >= paletteRgb.length) continue;
+      const col = paletteRgb[idx];
+      const off = (y * SPRITE_SIZE + x) * 4;
+      rgba[off] = col[0];
+      rgba[off + 1] = col[1];
+      rgba[off + 2] = col[2];
+      rgba[off + 3] = 255;
+      opaque++;
+    }
+  }
+
+  return opaque >= 16 ? rgba : null;
+}
+
+async function requestGeminiStructuredGridCandidate(params: {
+  approvedPrompt: EngineeredPromptSpec;
+  donorEntries: readonly IndexedSpriteEntry[];
+  lessonDirectives: string[];
+  temperature: number;
+  seed: number;
+}): Promise<{ rgba: Uint8ClampedArray; model: string }> {
+  const { approvedPrompt, donorEntries, lessonDirectives, temperature, seed } = params;
+  const images = encodeDonorSpritesAsPngDataUrls(donorEntries, 4);
+
+  const systemInstruction = [
+    'You are a master Classic Tibia 7.72 32x32 pixel artist.',
+    'Generate a crisp 32x32 indexed pixel-art sprite as strict JSON:',
+    '{"palette":["#RRGGBB",...],"rows":[32 strings of exactly 32 characters]}',
+    'Use "." for transparent pixels, and "1".."9","A".."Z" for 1-based palette indices.',
+    'STRICT RULES: binary alpha only, 1px dark hue-shifted outline around entire silhouette, NW directional lighting, zero anti-aliasing, zero orphan pixels, use ONLY colors from the approved paletteRamps.',
+  ].join(' ');
+
+  const userPrompt = [
+    `Item: ${approvedPrompt.itemName} (${approvedPrompt.category})`,
+    `Visual Brief: ${approvedPrompt.visualBrief}`,
+    `Approved Palette Ramps:\n${approvedPrompt.paletteRamps.map((r) => `- ${r.material}: ${r.colors.join(', ')}`).join('\n')}`,
+    `Constraints: footprint ~${approvedPrompt.constraints.footprintPx.width}x${approvedPrompt.constraints.footprintPx.height}px, maxColors=${approvedPrompt.constraints.maxColors}, outline="${approvedPrompt.constraints.outlineRule}", noDitheringOrAA=${approvedPrompt.constraints.noDitheringOrAA}, binaryAlpha=${approvedPrompt.constraints.binaryAlpha}`,
+    `Avoid: ${approvedPrompt.negativePrompt.join('; ')}`,
+    `Variation seed: ${seed}`,
+    lessonDirectives.length > 0 ? `Learned lessons:\n- ${lessonDirectives.slice(0, 4).join('\n- ')}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  const resp = await fetch('/api/gemini/generate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      prompt: userPrompt,
+      systemInstruction,
+      responseMimeType: 'application/json',
+      images,
+      temperature,
+    }),
+  });
+
+  const payload = (await resp.json().catch(() => ({}))) as {
+    text?: string;
+    model?: string;
+    error?: string;
+  };
+  if (!resp.ok || !payload.text) {
+    throw new Error(payload.error || `Gemini retornou HTTP ${resp.status}.`);
+  }
+
+  const rgba = decodeStructuredIndexedGridJson(payload.text);
+  if (!rgba) {
+    throw new Error('Gemini retornou grade 32×32 indexada inválida.');
+  }
+  return { rgba, model: payload.model || 'gemini' };
+}
+
+function medianNumber(values: readonly number[]): number | null {
+  if (values.length === 0) return null;
+  const s = values.slice().sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 === 1 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+}
+
+function evaluateHumannessGate(params: {
+  evaluation: CriticEvaluation;
+  nearestReal: ReturnType<typeof findNearestRealSprite>;
+}): HumannessGateInfo {
+  const { evaluation, nearestReal } = params;
+  const hardCount = countHardIssues(evaluation);
+  const discProb =
+    evaluation.discriminatorScore !== null
+      ? Math.max(0, Math.min(1, evaluation.discriminatorScore / 98.5))
+      : null;
+
+  // Similarity in 0..1 derived from exact nearest-real match
+  const similarity = Math.max(
+    0,
+    Math.min(1, 1 - nearestReal.originalityScore / 100),
+  );
+  const nearCopy =
+    similarity > 0.9 || (nearestReal.silhouetteIoU > 0.95 && nearestReal.pixelDiffRatio < 0.08);
+  const styleOutlier =
+    evaluation.calibrated && (evaluation.statisticalScore < 30 || hardCount > 0);
+
+  let rejectReasonPt: string | null = null;
+  if (nearCopy) {
+    rejectReasonPt = `Cópia muito próxima do real #${nearestReal.spriteId} (similaridade ${Math.round(similarity * 100)}% > 90%)`;
+  } else if (hardCount > 0) {
+    const firstHard = evaluation.issues.find((i) => i.severity === 'hard');
+    rejectReasonPt = `Violação de regra rígida: ${firstHard?.labelPt ?? 'higiene reprovada'}`;
+  } else if (styleOutlier) {
+    rejectReasonPt = `Outlier estilístico fora da categoria (estatístico ${evaluation.statisticalScore.toFixed(1)})`;
+  }
+
+  const passed = rejectReasonPt === null;
+
+  // Originality sweet-spot score: rewards genuine originality 22..82%, penalizes near-copies
+  const origTerm =
+    nearestReal.originalityScore < 10
+      ? 0
+      : nearestReal.originalityScore < 25
+        ? (nearestReal.originalityScore / 25) * 65
+        : Math.min(98, 65 + ((nearestReal.originalityScore - 25) / 60) * 33);
+
+  const discTerm = discProb !== null ? discProb * 100 : evaluation.hygieneScore;
+  const humanTerm = evaluation.humanPreferenceScore;
+
+  const baseScore =
+    humanTerm !== null
+      ? evaluation.score * 0.44 + discTerm * 0.24 + origTerm * 0.18 + humanTerm * 0.14
+      : evaluation.score * 0.5 + discTerm * 0.28 + origTerm * 0.22;
+
+  const humannessScore =
+    Math.round(Math.max(0, Math.min(99.5, passed ? baseScore : baseScore - 28)) * 10) / 10;
+
+  return {
+    passed,
+    humannessScore,
+    criticTerm: evaluation.score,
+    discriminatorProb: discProb !== null ? Math.round(discProb * 1000) / 1000 : null,
+    originalityScore: nearestReal.originalityScore,
+    similarityToNearest: Math.round(similarity * 1000) / 1000,
+    humanPreferenceTerm: humanTerm,
+    rejectReasonPt,
+  };
+}
+
+export interface GenerateFromApprovedPromptOptions {
+  datasetKey: string;
+  approvedPrompt: EngineeredPromptSpec;
+  engineeredPromptId: string;
+  engineeredPromptVersion: number;
+  promptSource: 'gemini' | 'manual';
+  candidateCount?: number; // 4..16, default 8
+  useGemini: boolean;
+  temperature?: number;
+  maxRepairIterations?: number; // K iterations, default 3
+  seed?: number;
+  index: SpriteIndexState;
+  calibration: CriticCalibration;
+  lessons?: readonly LessonRecord[];
+  approvals?: readonly ApprovalLabelRecord[];
+  approvedSprites?: readonly GeneratedSpriteRecord[];
+  champion?: CoevolutionChampion | null;
+}
+
+export interface GenerateFromApprovedPromptResult {
+  topCandidates: GeneratedSpriteRecord[];
+  secondaryCandidates: GeneratedSpriteRecord[];
+  allCandidates: GeneratedSpriteRecord[];
+  totalEvaluated: number;
+  passedGateCount: number;
+  fallbackWarning: string | null;
+  appliedLessonIds: string[];
+  categoryValidationRealMedian: number | null;
+  categoryValidationHardPassRate: number | null;
+  generatedHardPassRate: number;
+}
+
+/**
+ * STEP 2 HYBRID PIPELINE (executed ONLY after user clicks "OK, gerar"):
+ *  a) Generates N candidates (default 8, 4..16) with distinct seeds using approved prompt + donors
+ *     (structured 32x32 indexed grid via Gemini when enabled/available, or deterministic local T1/T2 hybrid).
+ *  b) Runs EVERY candidate through deterministic `tibiaifySprite` post-processing.
+ *  c) Runs Critic-guided iterative repair loop (up to K iterations; accepts ONLY on strict Critic score gain
+ *     with zero hard-rule regression).
+ *  d) Ranks via the "Humanness Gate" (Critic score, Discriminator P(real), Originality rejecting near-copies
+ *     >0.9 similarity & style outliers, and Human Preference when >= 6 mixed votes).
+ */
+export async function generateFromApprovedPrompt(
+  options: GenerateFromApprovedPromptOptions,
+): Promise<GenerateFromApprovedPromptResult> {
+  const {
+    datasetKey,
+    approvedPrompt,
+    engineeredPromptId,
+    engineeredPromptVersion,
+    promptSource,
+    candidateCount: rawCount = 8,
+    useGemini,
+    temperature = 0.45,
+    maxRepairIterations = 3,
+    seed = Date.now() & 0x7fffffff,
+    index,
+    calibration,
+    lessons = [],
+    approvals = [],
+    approvedSprites = [],
+    champion = null,
+  } = options;
+
+  const candidateCount = Math.max(4, Math.min(16, Math.round(rawCount)));
+  const category = approvedPrompt.category;
+
+  // Build train-only dataset palette RGB for snapping
+  const trainEntries = index.entries.filter((e) => e.split === 'train');
+  const paletteMap = new Map<string, [number, number, number]>();
+  for (const entry of trainEntries) {
+    for (let i = 0; i < entry.paletteHex.length; i++) {
+      const hex = entry.paletteHex[i];
+      if (!paletteMap.has(hex) && entry.paletteRgb[i]) {
+        paletteMap.set(hex, entry.paletteRgb[i]);
+      }
+    }
+  }
+  const datasetPaletteRgb = Array.from(paletteMap.values());
+
+  // Compute honest held-out validation real median & hard-rule pass rate for this category (NEVER test!)
+  const valEntries = index.entries.filter(
+    (e) => e.split === 'validation' && e.category === category,
+  );
+  const categoryValidationRealMedian = medianNumber(valEntries.map((e) => e.criticScore));
+  let categoryValidationHardPassRate: number | null = null;
+  if (valEntries.length > 0) {
+    let valHardClean = 0;
+    for (const v of valEntries) {
+      const ev = evaluateSprite(v.rgba, { category, calibration, isTileOverride: v.isTile });
+      if (countHardIssues(ev) === 0) valHardClean++;
+    }
+    categoryValidationHardPassRate = Math.round((valHardClean / valEntries.length) * 1000) / 10;
+  }
+
+  // Resolve prioritized donors strictly from `train`/`validation` present in `index` (NEVER test)
+  const indexById = new Map<number, IndexedSpriteEntry>();
+  for (const e of index.entries) {
+    if (e.split === 'train' || e.split === 'validation') {
+      indexById.set(e.spriteId, e);
+    }
+  }
+
+  const prioritizedDonors: IndexedSpriteEntry[] = [];
+  for (const suggestedId of approvedPrompt.donorSuggestions) {
+    const entry = indexById.get(suggestedId);
+    if (entry && !entry.isTile) {
+      prioritizedDonors.push(entry);
+    }
+  }
+  const retrievedFallback = retrieveDonorsForPrompt({
+    index,
+    category,
+    prompt: `${approvedPrompt.itemName} ${approvedPrompt.visualBrief}`,
+    topK: Math.max(8, candidateCount),
+    excludeTiles: true,
+    approvals,
+    approvedSprites,
+  });
+  for (const r of retrievedFallback) {
+    if (!prioritizedDonors.some((d) => d.spriteId === r.entry.spriteId)) {
+      prioritizedDonors.push(r.entry);
+    }
+  }
+
+  if (prioritizedDonors.length === 0) {
+    throw new Error(
+      `Nenhum sprite doador indexado para "${category}". Execute a indexação do dataset primeiro.`,
+    );
+  }
+
+  // Extract RGB ramps directly from the approved prompt
+  const parseRampToRgb = (colors: string[]): Array<[number, number, number]> => {
+    const out: Array<[number, number, number]> = [];
+    for (const h of colors) {
+      const rgb = hexToRgb(h);
+      if (rgb) out.push(rgb);
+    }
+    out.sort((a, b) => calcRgbLuma(a[0], a[1], a[2]) - calcRgbLuma(b[0], b[1], b[2]));
+    return out;
+  };
+
+  const fallbackRamp = selectMaterialRampForPrompt(approvedPrompt.itemName, 0);
+  const primaryStops =
+    approvedPrompt.paletteRamps[0] && parseRampToRgb(approvedPrompt.paletteRamps[0].colors).length >= 3
+      ? parseRampToRgb(approvedPrompt.paletteRamps[0].colors)
+      : fallbackRamp.primary;
+  const accentStops =
+    approvedPrompt.paletteRamps[1] && parseRampToRgb(approvedPrompt.paletteRamps[1].colors).length >= 3
+      ? parseRampToRgb(approvedPrompt.paletteRamps[1].colors)
+      : fallbackRamp.accent;
+
+  const applicableLessons = retrieveLessonsForQuery(lessons, {
+    category,
+    datasetKey,
+    limit: 6,
+  });
+  const appliedLessonIds = applicableLessons.map((r) => r.lesson.id);
+  const lessonDirectives = applicableLessons.map((r) => `${r.lesson.title}: ${r.lesson.directive}`);
+
+  const categoryProfile =
+    calibration.profiles[category]?.sampleCount >= 3
+      ? calibration.profiles[category]
+      : calibration.globalProfile;
+
+  let fallbackWarning: string | null = null;
+  let geminiAvailableForBatch = useGemini;
+
+  const spliceModes: Array<'center_core' | 'upper_crest' | 'lower_trim'> = [
+    'center_core',
+    'upper_crest',
+    'lower_trim',
+  ];
+
+  const createdAt = new Date().toISOString();
+  const builtRecords: GeneratedSpriteRecord[] = [];
+
+  for (let c = 0; c < candidateCount; c++) {
+    const candSeed = (seed + c * 9973 + 17) >>> 0;
+    const primaryDonor = prioritizedDonors[c % prioritizedDonors.length];
+    const secondaryDonor =
+      prioritizedDonors[(c + 1 + Math.floor(c / 2)) % prioritizedDonors.length];
+
+    let rawRgba: Uint8ClampedArray | null = null;
+    let source: GenerationProvenanceSource = c % 2 === 0 ? 'local-t2' : 'local-t1';
+    let tierUsed: GenerationTier = c % 2 === 0 ? 'T2' : 'T1';
+    let modelUsed: string | null = null;
+    let donorSpriteIds: number[] = [primaryDonor.spriteId];
+    let diffPixelCount = 0;
+    const diffPixelLimit = 32;
+
+    // Step 2a: Prefer Gemini structured 32x32 indexed grid for first 2 candidates when enabled
+    if (geminiAvailableForBatch && c < 2) {
+      try {
+        const gRes = await requestGeminiStructuredGridCandidate({
+          approvedPrompt,
+          donorEntries: prioritizedDonors.slice(0, 4),
+          lessonDirectives,
+          temperature,
+          seed: candSeed,
+        });
+        rawRgba = gRes.rgba;
+        source = 'gemini-t2';
+        tierUsed = 'T2';
+        modelUsed = gRes.model;
+        donorSpriteIds = prioritizedDonors.slice(0, 3).map((d) => d.spriteId);
+        diffPixelCount = 32;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'erro desconhecido';
+        fallbackWarning = `Gemini indisponível na geração de grade (${msg}). Candidatos sintetizados explicitamente em modo local (local-t1/local-t2) + tibiaify.`;
+        geminiAvailableForBatch = false;
+      }
+    }
+
+    // Local hybrid synthesis using approved ramps + prioritized donors + bounded motifs
+    if (!rawRgba) {
+      const useComposite = prioritizedDonors.length >= 2 && c % 2 === 0;
+      let synthBase: Uint8ClampedArray;
+      if (useComposite) {
+        synthBase = executeDonorComposite({
+          primaryRgba: primaryDonor.rgba,
+          secondaryRgba: secondaryDonor.rgba,
+          primaryStops,
+          accentStops,
+          spliceMode: spliceModes[c % spliceModes.length],
+          isTile: primaryDonor.isTile,
+        });
+        source = 'local-t2';
+        tierUsed = 'T2';
+        donorSpriteIds = Array.from(new Set([primaryDonor.spriteId, secondaryDonor.spriteId]));
+      } else {
+        synthBase = executeRampRecolor({
+          sourceRgba: primaryDonor.rgba,
+          primaryStops,
+          accentStops,
+          isTile: primaryDonor.isTile,
+        }).rgba;
+        source = 'local-t1';
+        tierUsed = 'T1';
+        donorSpriteIds = [primaryDonor.spriteId];
+      }
+
+      const edits = buildDeterministicDiffEdits({
+        baseRgba: synthBase,
+        accentStops,
+        highlightStop: primaryStops[primaryStops.length - 1],
+        maxDiffPixels: diffPixelLimit,
+        seed: candSeed,
+      });
+      const diffRes = executeBoundedPixelDiff({
+        baseRgba: synthBase,
+        edits,
+        maxDiffPixels: diffPixelLimit,
+        preserveOutline: true,
+        isTile: primaryDonor.isTile,
+      });
+      rawRgba = diffRes.rgba;
+      diffPixelCount = diffRes.appliedCount;
+    }
+
+    // Step 2b: Deterministic "Tibia-ification" post-processor on EVERY candidate
+    const tib = tibiaifySprite({
+      rgba: rawRgba,
+      width: SPRITE_SIZE,
+      height: SPRITE_SIZE,
+      approvedRamps: approvedPrompt.paletteRamps,
+      datasetPaletteRgb,
+      categoryProfile,
+      maxColors: approvedPrompt.constraints.maxColors,
+      isTile: primaryDonor.isTile,
+      allowDithering: !approvedPrompt.constraints.noDitheringOrAA,
+      targetCenterGround: true,
+    });
+
+    let currentRgba = tib.rgba;
+    let currentEval = evaluateSprite(currentRgba, {
+      category,
+      calibration,
+      isTileOverride: primaryDonor.isTile,
+    });
+    const preRepairScore = currentEval.score;
+
+    // Step 2c: Critic-guided iterative repair loop (up to K iterations, accept ONLY on strict improvement + 0 hard regressions)
+    let repaired = false;
+    let repairMethod: 'none' | 'champion_coevolution' | 'critic_targeted_ops' = 'none';
+    const maxIters = Math.max(1, Math.min(5, Math.round(maxRepairIterations)));
+
+    for (let iter = 0; iter < maxIters; iter++) {
+      const rep = runCriticGuidedRepair({
+        rgba: currentRgba,
+        baseEval: currentEval,
+        category,
+        calibration,
+        champion,
+      });
+      if (!rep.repaired) break;
+      // Re-verify binary alpha and zero hard-rule regression
+      if (
+        countHardIssues(rep.evaluation) <= countHardIssues(currentEval) &&
+        rep.evaluation.score > currentEval.score + 0.1
+      ) {
+        currentRgba = rep.rgba;
+        currentEval = rep.evaluation;
+        repaired = true;
+        repairMethod = rep.repairMethod;
+      } else {
+        break;
+      }
+    }
+
+    const repairDelta = Math.max(0, Math.round((currentEval.score - preRepairScore) * 10) / 10);
+    const nearestReal = findNearestRealSprite(currentRgba, index);
+    const humannessGate = evaluateHumannessGate({
+      evaluation: currentEval,
+      nearestReal,
+    });
+    const dec = decomposeSpriteToIndexedAndRampRoles(currentRgba);
+
+    builtRecords.push({
+      id: `eng-${Date.now().toString(36)}-${(candSeed % 99991).toString(36)}-${c}`,
+      datasetKey,
+      prompt: `${approvedPrompt.itemName} — ${approvedPrompt.visualBrief.slice(0, 120)}`,
+      category,
+      createdAt,
+      rgba: currentRgba,
+      paletteHex: dec.paletteHex,
+      evaluation: currentEval,
+      nearestReal,
+      provenance: {
+        source,
+        tier: tierUsed,
+        model: modelUsed,
+        fallbackWarning,
+        donorSpriteIds,
+        diffPixelCount,
+        diffPixelLimit,
+        repaired,
+        repairDelta,
+        repairMethod,
+        appliedLessonIds,
+        seed: candSeed,
+        engineeredPromptId,
+        engineeredPromptVersion,
+        promptSource,
+        approvedPromptSnapshot: approvedPrompt,
+        tibiaified: true,
+        humannessGate,
+        validationCategoryRealMedian: categoryValidationRealMedian,
+      },
+      approvalStatus: 'pending',
+      readBackVerified: false,
+    });
+  }
+
+  // Step 2d: Rank all candidates by Humanness Gate (passing candidates first, then humannessScore desc)
+  builtRecords.sort((a, b) => {
+    const ga = a.provenance.humannessGate;
+    const gb = b.provenance.humannessGate;
+    const passA = ga?.passed ? 1 : 0;
+    const passB = gb?.passed ? 1 : 0;
+    if (passB !== passA) return passB - passA;
+    const hsA = ga?.humannessScore ?? a.evaluation.score;
+    const hsB = gb?.humannessScore ?? b.evaluation.score;
+    if (hsB !== hsA) return hsB - hsA;
+    return b.evaluation.score - a.evaluation.score;
+  });
+
+  const passedGateCount = builtRecords.filter((r) => r.provenance.humannessGate?.passed).length;
+  const hardCleanCount = builtRecords.filter((r) => countHardIssues(r.evaluation) === 0).length;
+  const generatedHardPassRate =
+    builtRecords.length > 0 ? Math.round((hardCleanCount / builtRecords.length) * 1000) / 10 : 0;
+
+  const topCount = Math.min(4, builtRecords.length);
+  const topCandidates = builtRecords.slice(0, topCount);
+  const secondaryCandidates = builtRecords.slice(topCount);
+
+  return {
+    topCandidates,
+    secondaryCandidates,
+    allCandidates: builtRecords,
+    totalEvaluated: builtRecords.length,
+    passedGateCount,
+    fallbackWarning,
+    appliedLessonIds,
+    categoryValidationRealMedian,
+    categoryValidationHardPassRate,
+    generatedHardPassRate,
+  };
+}
+

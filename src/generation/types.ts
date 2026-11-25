@@ -80,6 +80,112 @@ export interface NearestRealMatch {
   originalityScore: number; // 0..99.5 honest originality metric
 }
 
+export interface PaletteRampSpec {
+  material: string;
+  colors: string[]; // 3-5 #RRGGBB hex stops darkest -> brightest (outline, shadow, base, light, highlight)
+}
+
+export interface PromptConstraintsSpec {
+  footprintPx: {
+    width: number;
+    height: number;
+  };
+  maxColors: number;
+  outlineRule: string;
+  noDitheringOrAA: boolean;
+  binaryAlpha: boolean;
+}
+
+export interface EngineeredPromptSpec {
+  itemName: string;
+  category: ItemCategory;
+  visualBrief: string;
+  paletteRamps: PaletteRampSpec[];
+  constraints: PromptConstraintsSpec;
+  negativePrompt: string[];
+  donorSuggestions: number[]; // 3-6 real sprite IDs strictly from train/validation (NEVER test)
+}
+
+export interface StyleDossierDonor {
+  spriteId: number;
+  split: 'train';
+  category: ItemCategory;
+  tags: string[];
+  paletteHex: string[];
+  bboxW: number;
+  bboxH: number;
+  opaqueCount: number;
+  criticScore: number;
+  asciiPreview: string; // compact 16x16 silhouette/tone map for LLM conditioning
+}
+
+export interface StyleDossier {
+  datasetKey: string;
+  category: ItemCategory;
+  idea: string;
+  splitSource: 'train_only';
+  trainSampleCount: number;
+  categoryMedians: {
+    distinctColorsP50: number;
+    distinctColorsP10: number;
+    distinctColorsP90: number;
+    rampLengthP50: number;
+    outlineCoverageP50: number;
+    outlineDarknessDeltaP50: number;
+    outlineDoublesRatioP50: number;
+    nwLightGradientP50: number;
+    ditherShareP50: number;
+    silhouetteFillRatioP50: number;
+    typicalBboxW: number;
+    typicalBboxH: number;
+  };
+  topPaletteHex: string[];
+  fewShotDonors: StyleDossierDonor[];
+  allowedDonorIds: number[]; // train + validation sprite IDs only (test strictly excluded)
+  activeLessons: Array<{
+    id: string;
+    source: 'mined' | 'critic_loop' | 'human_feedback';
+    polarity: 'enforce' | 'avoid';
+    title: string;
+    directive: string;
+  }>;
+}
+
+export interface PromptDiffChange {
+  field: string;
+  labelPt: string;
+  before: string;
+  after: string;
+}
+
+export interface PromptHistoryRecord {
+  id: string;
+  datasetKey: string;
+  requestId: string;
+  version: number;
+  idea: string;
+  parentVersionId: string | null;
+  adjustmentComment: string | null;
+  source: 'gemini' | 'manual';
+  model: string | null;
+  engineeredPrompt: EngineeredPromptSpec;
+  approved: boolean;
+  approvedAt: string | null;
+  createdAt: string;
+  readBackVerified: boolean;
+}
+
+export interface HumannessGateInfo {
+  passed: boolean;
+  humannessScore: number;
+  criticTerm: number;
+  discriminatorProb: number | null;
+  originalityScore: number;
+  similarityToNearest: number;
+  humanPreferenceTerm: number | null;
+  rejectReasonPt: string | null;
+}
+
 export interface GenerationProvenance {
   source: GenerationProvenanceSource;
   tier: GenerationTier;
@@ -93,6 +199,13 @@ export interface GenerationProvenance {
   repairMethod: 'none' | 'champion_coevolution' | 'critic_targeted_ops';
   appliedLessonIds: string[];
   seed: number;
+  engineeredPromptId?: string;
+  engineeredPromptVersion?: number;
+  promptSource?: 'gemini' | 'manual';
+  approvedPromptSnapshot?: EngineeredPromptSpec;
+  tibiaified?: boolean;
+  humannessGate?: HumannessGateInfo;
+  validationCategoryRealMedian?: number | null;
 }
 
 export interface GeneratedSpriteRecord {
