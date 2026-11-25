@@ -1,0 +1,6 @@
+{
+  "name": "Atelier Sprite — Estúdio de Pixel Art Multiagente",
+  "description": "Estúdio profissional de pixel art 32×32 para leitura binária de arquivos .dat/.spr e integração com motor local de treinamento multiagente em Python.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

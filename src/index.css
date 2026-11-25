@@ -1,0 +1,99 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+    font-family: var(--font-sans);
+    background-color: #0d0f13;
+    color: #f1f3f7;
+  }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background-color: #0d0f13;
+    color: #f1f3f7;
+    letter-spacing: 0.005em;
+  }
+
+  button:not(:disabled),
+  select:not(:disabled),
+  input[type="checkbox"]:not(:disabled),
+  input[type="range"]:not(:disabled) {
+    cursor: pointer;
+  }
+}
+
+.pixelated {
+  image-rendering: -moz-crisp-edges;
+  image-rendering: -webkit-crisp-edges;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}
+
+.checkerboard-dark {
+  background-color: #161920;
+  background-image:
+    linear-gradient(45deg, #1f242e 25%, transparent 25%),
+    linear-gradient(-45deg, #1f242e 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #1f242e 75%),
+    linear-gradient(-45deg, transparent 75%, #1f242e 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0px;
+}
+
+/* Custom sleek studio range slider */
+input[type="range"].studio-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  height: 20px;
+}
+
+input[type="range"].studio-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: #262b36;
+}
+
+input[type="range"].studio-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  background: #e5a93c;
+  border: 1px solid #0d0f13;
+  margin-top: -5px;
+  transition: transform 150ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+input[type="range"].studio-slider::-webkit-slider-thumb:hover {
+  transform: scale(1.12);
+}
+
+input[type="range"].studio-slider::-moz-range-track {
+  height: 4px;
+  border-radius: 2px;
+  background: #262b36;
+}
+
+input[type="range"].studio-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  background: #e5a93c;
+  border: 1px solid #0d0f13;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
